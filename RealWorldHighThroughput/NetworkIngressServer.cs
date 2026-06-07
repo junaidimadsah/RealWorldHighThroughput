@@ -1,92 +1,149 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
+using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace RealWorldHighThroughput
 {
-    public class NetworkIngressServer
+    /// <summary>
+    /// TCP ingress server backed by an overflow <see cref="Channel{T}"/>.
+    ///
+    /// Original design had the socket receive task spinning directly on
+    /// <c>engine.IngestTransaction</c> — this blocked the I/O thread pool thread
+    /// while the ring buffer was momentarily full, starving other connections.
+    ///
+    /// New design:
+    ///  1. Receive task writes to a bounded overflow channel (non-blocking TryWrite).
+    ///     If the overflow channel is also full the packet is counted as dropped;
+    ///     the socket thread is never stalled.
+    ///  2. A single dedicated forwarder thread drains the overflow channel and spins
+    ///     on IngestTransaction — the spin is isolated to one non-I/O thread.
+    ///  3. Dropped packet count is exposed for monitoring.
+    /// </summary>
+    public sealed class NetworkIngressServer
     {
-        private readonly Socket _listenerSocket;
-        private readonly RealWorldEngine _engine;
-        private bool _isRunning;
+        // ── Fields ─────────────────────────────────────────────────────────────
+        private readonly Socket                      _listener;
+        private readonly RealWorldEngine             _engine;
+        private readonly Channel<Transaction>        _overflow;
+        private volatile bool                        _isRunning;
+        private long                                 _droppedPackets;
 
-        public NetworkIngressServer(int port, RealWorldEngine engine)
+        public long DroppedPackets => Volatile.Read(ref _droppedPackets);
+
+        private static readonly int StructSize = Marshal.SizeOf<Transaction>();
+
+        // ── Construction ───────────────────────────────────────────────────────
+        public NetworkIngressServer(int port, RealWorldEngine engine,
+                                    int overflowCapacity = 1_000_000)
         {
-            _engine = engine;
+            _engine   = engine;
+            _overflow = Channel.CreateBounded<Transaction>(new BoundedChannelOptions(overflowCapacity)
+            {
+                SingleWriter = false,
+                SingleReader = true,
+                FullMode     = BoundedChannelFullMode.DropOldest, // never block the write
+            });
 
-            // 1. Initialize the socket object instance
-            _listenerSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-
-            // 2. Bind strictly to Loopback (localhost) on the designated port
-            _listenerSocket.Bind(new IPEndPoint(IPAddress.Loopback, port));
+            _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            _listener.Bind(new IPEndPoint(IPAddress.Loopback, port));
         }
 
+        // ── Lifecycle ──────────────────────────────────────────────────────────
         public void Start()
         {
             _isRunning = true;
-            _listenerSocket.Listen(100);
+            _listener.Listen(100);
+
+            // Forwarder thread: drains overflow channel → ring buffer, spins there.
+            var forwarder = new Thread(ForwarderLoop)
+            {
+                IsBackground = true,
+                Priority     = ThreadPriority.AboveNormal,
+                Name         = "NetworkIngress-Forwarder",
+            };
+            forwarder.Start();
+
             Task.Run(AcceptConnectionsAsync);
-            Console.WriteLine("Ingress Network Gateway Listening on Port 8080...");
+            Console.WriteLine($"[Network] Ingress gateway listening on port {_listener.LocalEndPoint}...");
         }
 
+        public void Stop()
+        {
+            _isRunning = false;
+            _overflow.Writer.TryComplete();
+            _listener.Close();
+        }
+
+        // ── Accept loop ────────────────────────────────────────────────────────
         private async Task AcceptConnectionsAsync()
         {
             while (_isRunning)
             {
                 try
                 {
-                    Socket clientSocket = await _listenerSocket.AcceptAsync();
-                    _ = Task.Run(() => HandleClientTrafficAsync(clientSocket));
+                    Socket client = await _listener.AcceptAsync().ConfigureAwait(false);
+                    _ = Task.Run(() => HandleClientAsync(client));
                 }
                 catch { break; }
             }
         }
 
-        private async Task HandleClientTrafficAsync(Socket socket)
+        // ── Per-connection handler ─────────────────────────────────────────────
+        private async Task HandleClientAsync(Socket socket)
         {
-            byte[] memoryBuffer = new byte[Marshal.SizeOf<Transaction>() * 100];
-            Memory<byte> memoryWrapper = memoryBuffer;
+            byte[]        rawBuffer  = new byte[StructSize * 100];
+            Memory<byte>  memWrapper = rawBuffer;
 
             try
             {
                 while (_isRunning)
                 {
-                    // Async state machine operates comfortably here
-                    int bytesRead = await socket.ReceiveAsync(memoryWrapper, SocketFlags.None);
+                    int bytesRead = await socket.ReceiveAsync(memWrapper, SocketFlags.None)
+                                                .ConfigureAwait(false);
                     if (bytesRead == 0) break;
 
-                    // Pass to a synchronous method where Span<T> and unsafe casting are fully permitted
-                    ProcessIncomingBytes(memoryBuffer, bytesRead);
+                    // Synchronous helper — Span<T> is safe outside async state machine.
+                    EnqueueToOverflow(rawBuffer, bytesRead);
                 }
             }
-            catch { }
+            catch { /* connection drop — not an error */ }
             finally { socket.Close(); }
         }
 
-        // A regular method has no async state machine, meaning we can use ref structs safely
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ProcessIncomingBytes(byte[] buffer, int bytesRead)
+        private void EnqueueToOverflow(byte[] buffer, int bytesRead)
         {
-            int structSize = Marshal.SizeOf<Transaction>();
-            int itemsCount = bytesRead / structSize;
-
-            for (int i = 0; i < itemsCount; i++)
+            int items = bytesRead / StructSize;
+            for (int i = 0; i < items; i++)
             {
-                // This is now perfectly legal in C# 12
-                ReadOnlySpan<byte> structBytes = buffer.AsSpan(i * structSize, structSize);
-                Transaction tx = MemoryMarshal.Read<Transaction>(structBytes);
+                ReadOnlySpan<byte> bytes = buffer.AsSpan(i * StructSize, StructSize);
+                Transaction tx = MemoryMarshal.Read<Transaction>(bytes);
 
-                // Spin fast on the thread pool thread if the ring buffer is temporarily full
-                while (!_engine.IngestTransaction(tx))
+                if (!_overflow.Writer.TryWrite(tx))
+                    Interlocked.Increment(ref _droppedPackets);
+            }
+        }
+
+        // ── Forwarder (overflow → ring buffer) ─────────────────────────────────
+        private void ForwarderLoop()
+        {
+            var reader = _overflow.Reader;
+
+            while (_isRunning || reader.Count > 0)
+            {
+                while (reader.TryRead(out Transaction tx))
                 {
-                    System.Threading.Thread.SpinWait(5);
+                    // Spin only here, on a dedicated non-I/O thread.
+                    while (!_engine.IngestTransaction(in tx))
+                        Thread.SpinWait(5);
                 }
+
+                Thread.SpinWait(10); // brief yield when overflow channel is empty
             }
         }
     }

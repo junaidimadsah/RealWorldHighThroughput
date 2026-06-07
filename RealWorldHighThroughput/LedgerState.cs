@@ -1,40 +1,50 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace RealWorldHighThroughput
 {
-    public class LedgerState
+    /// <summary>
+    /// In-memory ledger. Balances are stored as fixed-point longs in the same minor-unit
+    /// scale as <see cref="Transaction.Amount"/> (×10,000 — i.e. $1.00 == 10_000).
+    ///
+    /// Replacing decimal with long means every balance mutation is a native 64-bit
+    /// integer subtract/add — no software-emulated decimal arithmetic on the hot path.
+    /// </summary>
+    public sealed class LedgerState
     {
-        // Pre-allocate arrays for O(1) index-based lookups to avoid dictionary collisions
-        private readonly decimal[] _balances;
+        private readonly long[] _balances;
+
+        // $10,000,000.00 expressed in minor units (×10,000)
+        private const long InitialBalance = 10_000_000_00_00L; // 100_000_000_000
 
         public LedgerState(int maxAccounts)
         {
-            _balances = new decimal[maxAccounts];
-            // Initialize dummy accounts with starting balances
+            _balances = new long[maxAccounts];
             for (int i = 0; i < maxAccounts; i++)
-            {
-                _balances[i] = 10_000_000.00m;
-            }
+                _balances[i] = InitialBalance;
         }
 
+        /// <summary>
+        /// Apply a transfer. Both srcAcc and destAcc must be valid indices.
+        /// Returns false (insufficient funds) without mutating state when the source
+        /// balance would go negative.
+        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool ProcessTransfer(long srcAcc, long destAcc, decimal amount)
+        public bool ProcessTransfer(long srcAcc, long destAcc, long amountMinorUnits)
         {
-            // Real-world business logic check
-            if (_balances[srcAcc] < amount)
-                return false; // Insufficient Funds
+            if (_balances[srcAcc] < amountMinorUnits)
+                return false; // Insufficient funds — no mutation
 
-            _balances[srcAcc] -= amount;
-            _balances[destAcc] += amount;
+            _balances[srcAcc]  -= amountMinorUnits;
+            _balances[destAcc] += amountMinorUnits;
             return true;
         }
 
+        /// <summary>Returns the balance in minor units.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public decimal GetBalance(long accountId) => _balances[accountId];
+        public long GetBalance(long accountId) => _balances[accountId];
+
+        /// <summary>Returns the balance as a human-readable decimal value.</summary>
+        public decimal GetBalanceDecimal(long accountId) =>
+            Transaction.FromMinorUnits(_balances[accountId]);
     }
 }
