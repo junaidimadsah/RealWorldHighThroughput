@@ -11,39 +11,48 @@ namespace RealWorldHighThroughput
             Console.WriteLine("=== Starting High-Throughput Memory Core Pipeline ===");
             Console.WriteLine($"    Logical CPUs detected : {Environment.ProcessorCount}");
 
+            // ── Parse optional host/port from command line ─────────────────────
+            // Usage: RealWorldHighThroughput [host] [port]
+            // Defaults: 127.0.0.1  9095
+            string host = args.Length > 0 ? args[0] : "127.0.0.1";
+            int    port = args.Length > 1 && int.TryParse(args[1], out int p) ? p : 9095;
+
+            Console.WriteLine($"    Outbound target       : {host}:{port}");
+
             // ── Component initialisation ───────────────────────────────────────
             var ledger    = new LedgerState(maxAccounts: 1_000_000);
             var journaler = new TransactionJournaler();
 
-            // laneCapacity: total ring buffer capacity spread across N lanes.
-            // With 4 lanes each gets 1M slots; with 8 lanes each gets 512K slots.
-            // Using 0 for laneCount lets the engine auto-detect from CPU count.
             var engine = new RealWorldEngine(
-                laneCapacity : 1_048_576,   // 1M slots per lane (power of two)
+                laneCapacity : 1_048_576,
                 ledger       : ledger,
                 journaler    : journaler,
-                laneCount    : 0);          // auto-detect
+                laneCount    : 0);          // auto-detect from CPU count
 
-            var server = new GodSharpIngressServer(port: 9095, engine);
+            // GodSharpIngressClient replaces GodSharpIngressServer.
+            // It forwards every processed transaction to the remote server over TCP.
+            // If the server is unavailable it queues and retries — the engine is unaffected.
+            var client = new GodSharpIngressClient(host, port);
+            engine.SetSender(client);
 
+            // Start order: journaler → client → engine
+            // Engine must start last so consumer threads see a fully wired sender.
             journaler.Start();
+            client.Start();
             engine.Start();
-            server.Start();
 
             // ── Benchmark transaction ──────────────────────────────────────────
-            // Amount: $150.75 encoded as minor units (×10,000).
             Transaction tx = new Transaction
             {
                 SourceAccountId      = 500_021,
                 DestinationAccountId = 900_042,
-                Amount               = Transaction.ToMinorUnits(150.75m), // 1_507_500
+                Amount               = Transaction.ToMinorUnits(150.75m), // 1_507_500 minor units
                 TimestampTicks       = DateTime.UtcNow.Ticks,
             };
 
             const long TotalSubmissions = 10_000_000;
 
             Console.WriteLine($"    Submitting            : {TotalSubmissions:N0} transactions");
-            Console.WriteLine($"    Engine lanes          : {engine /* expose via property if needed */}");
             Console.WriteLine();
 
             var watch = Stopwatch.StartNew();
@@ -52,7 +61,7 @@ namespace RealWorldHighThroughput
             for (long i = 0; i < TotalSubmissions; i++)
             {
                 tx.TransactionId  = i;
-                tx.TimestampTicks = DateTime.UtcNow.Ticks; // update per-tx timestamp
+                tx.TimestampTicks = DateTime.UtcNow.Ticks;
 
                 while (!engine.IngestTransaction(in tx))
                     Thread.SpinWait(5);
@@ -71,12 +80,15 @@ namespace RealWorldHighThroughput
             Console.WriteLine($"Execution Time         : {seconds:F4} seconds");
             Console.WriteLine($"Throughput             : {engine.ProcessedCount / seconds:N0} TPS");
             Console.WriteLine($"Journaler drops        : {journaler.DroppedCount:N0}");
-            Console.WriteLine($"Network drops          : {server.DroppedPackets:N0}");
+            Console.WriteLine($"Client send drops      : {client.DroppedPackets:N0}");
             Console.WriteLine("=======================================================");
 
+            // ── Shutdown order: engine → journaler → client ───────────────────
+            // Stop engine first so no new transactions are handed to the client.
+            // Stop client last so it can flush any remaining queued transactions.
             engine.Stop();
             journaler.Stop();
-            server.Stop();
+            client.Stop();
 
             Console.WriteLine("\nPress any key to exit...");
             Console.ReadKey();

@@ -14,16 +14,16 @@ namespace RealWorldHighThroughput
     ///  3. LedgerState.ProcessTransfer now receives a long (minor units) instead of
     ///     a decimal cast from double — eliminates the cast on the hot path.
     ///  4. TimestampTicks is forwarded to QueueLog instead of calling DateTime.UtcNow.
+    ///  5. Optional IGodSharpSender hook: after journaling, each processed transaction
+    ///     is forwarded to the sender (e.g. GodSharpIngressClient). The hook costs one
+    ///     null check per transaction on the hot path when no sender is configured.
     /// </summary>
     public sealed class RealWorldEngine
     {
         // ── Configuration ──────────────────────────────────────────────────────
-        // Lane count defaults to the number of physical/logical processors, capped
-        // so we never spawn more threads than there are cores to run them.
         private static int DefaultLaneCount()
         {
             int cores = Environment.ProcessorCount;
-            // Round down to next power of two so the lane mask trick works.
             int lanes = 1;
             while (lanes * 2 <= cores && lanes < 16) lanes *= 2;
             return lanes;
@@ -38,6 +38,10 @@ namespace RealWorldHighThroughput
         private readonly int                   _laneCount;
         private volatile bool                  _isRunning;
         private long                           _processedCount;
+
+        // Optional outbound sender. Null = no forwarding (zero overhead beyond a
+        // null check). Set via SetSender() before calling Start().
+        private IGodSharpSender?               _sender;
 
         public long ProcessedCount => Volatile.Read(ref _processedCount);
 
@@ -56,13 +60,21 @@ namespace RealWorldHighThroughput
             _partitioned = new PartitionedRingBuffer(_laneCount, laneCapacity);
         }
 
+        // ── Sender wiring ──────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Attach an outbound sender. Must be called before <see cref="Start"/>.
+        /// Passing null removes any previously attached sender.
+        /// </summary>
+        public void SetSender(IGodSharpSender? sender) => _sender = sender;
+
         // ── Lifecycle ──────────────────────────────────────────────────────────
         public void Start()
         {
             _isRunning = true;
             for (int i = 0; i < _laneCount; i++)
             {
-                int laneIndex = i; // capture for closure
+                int laneIndex = i;
                 var thread = new Thread(() => ConsumerLoop(laneIndex))
                 {
                     IsBackground = true,
@@ -77,10 +89,6 @@ namespace RealWorldHighThroughput
 
         // ── Hot path ───────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Ingest a transaction from any producer thread (network ingress, benchmark loop, etc.).
-        /// Routes to the correct lane via SourceAccountId and returns false if that lane is full.
-        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool IngestTransaction(in Transaction tx) => _partitioned.TryEnqueue(in tx);
 
@@ -88,15 +96,14 @@ namespace RealWorldHighThroughput
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private void ConsumerLoop(int laneIndex)
         {
-            UltraRingBuffer lane = _partitioned.GetLane(laneIndex);
+            UltraRingBuffer   lane   = _partitioned.GetLane(laneIndex);
+            IGodSharpSender?  sender = _sender; // local copy — avoids volatile read per tx
 
-            // Stack-allocated batch buffer — lives on the thread stack, no GC.
-            Span<Transaction> batch = stackalloc Transaction[BatchSize];
-            int batchIndex = 0;
+            Span<Transaction> batch      = stackalloc Transaction[BatchSize];
+            int               batchIndex = 0;
 
             while (_isRunning)
             {
-                // Drain up to BatchSize items from this lane's ring buffer.
                 while (batchIndex < BatchSize && lane.TryDequeue(out Transaction tx))
                     batch[batchIndex++] = tx;
 
@@ -106,14 +113,16 @@ namespace RealWorldHighThroughput
                     {
                         ref readonly Transaction tx = ref batch[i];
 
-                        // Amount is already in minor units (long) — no cast needed.
                         bool success = _ledger.ProcessTransfer(
                             tx.SourceAccountId,
                             tx.DestinationAccountId,
                             tx.Amount);
 
-                        // Pass the transaction's own timestamp — no syscall here.
                         _journaler.QueueLog(tx.TransactionId, success, tx.TimestampTicks);
+
+                        // Forward to outbound sender if one is configured.
+                        // One null check per transaction — negligible cost.
+                        sender?.Send(in tx);
                     }
 
                     Interlocked.Add(ref _processedCount, batchIndex);
@@ -121,8 +130,6 @@ namespace RealWorldHighThroughput
                 }
                 else
                 {
-                    // Brief spin-wait before re-checking — avoids burning a full core
-                    // while keeping latency low when new work arrives.
                     Thread.SpinWait(15);
                 }
             }
